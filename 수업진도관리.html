@@ -280,6 +280,17 @@ function getSyncableState(){
   };
 }
 
+function parseCloudDoc(data){
+  if(!data) return null;
+  if(data.payload){
+    try{ return JSON.parse(data.payload); }
+    catch(e){ console.warn('클라우드 데이터 파싱 실패', e); return null; }
+  }
+  // backward-compat: in case a doc was ever written in the old (pre-JSON-blob) shape
+  if(data.classes && data.baseTimetable) return data;
+  return null;
+}
+
 async function loadFirebaseModules(){
   if(loadFirebaseModules._cache) return loadFirebaseModules._cache;
   const appMod = await import('https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js');
@@ -312,7 +323,9 @@ async function pushStateToCloud(){
   try{
     const { doc, setDoc } = await loadFirebaseModules();
     const ref = doc(cloud.db, 'jindoSync', cloud.code);
-    await setDoc(ref, getSyncableState());
+    // Firestore doesn't support nested arrays (baseTimetable is an array of arrays),
+    // so the whole state is serialized into one JSON string field instead.
+    await setDoc(ref, { payload: JSON.stringify(getSyncableState()), updatedAt: new Date().toISOString() });
     updateCloudStatus('ok', '동기화 연결됨 · 마지막 전송 ' + nowTimeLabel());
   }catch(e){
     console.warn('클라우드 전송 실패', e);
@@ -383,8 +396,11 @@ async function connectCloud(isAuto){
     if(!isAuto){
       const snap = await getDoc(ref);
       if(snap.exists()){
-        const useCloud = confirm('클라우드에 이미 저장된 데이터가 있어요.\n\n확인 = 클라우드 데이터를 불러와 이 기기에 적용\n취소 = 지금 이 기기의 데이터를 클라우드에 올리기(덮어쓰기)');
-        if(useCloud) applyRemoteData(snap.data());
+        const remoteData = parseCloudDoc(snap.data());
+        if(remoteData){
+          const useCloud = confirm('클라우드에 이미 저장된 데이터가 있어요.\n\n확인 = 클라우드 데이터를 불러와 이 기기에 적용\n취소 = 지금 이 기기의 데이터를 클라우드에 올리기(덮어쓰기)');
+          if(useCloud) applyRemoteData(remoteData);
+        }
       }
     }
 
@@ -397,9 +413,9 @@ async function connectCloud(isAuto){
     if(cloud.unsub) cloud.unsub();
     cloud.unsub = onSnapshot(ref, (snapshot)=>{
       if(snapshot.metadata.hasPendingWrites) return;
-      const data = snapshot.data();
-      if(!data) return;
-      applyRemoteData(data);
+      const remoteData = parseCloudDoc(snapshot.data());
+      if(!remoteData) return;
+      applyRemoteData(remoteData);
     }, (err)=>{
       updateCloudStatus('err', '동기화 오류: ' + err.message);
     });
