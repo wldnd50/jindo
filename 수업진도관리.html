@@ -74,7 +74,11 @@
     font-size:16px; padding:9px 10px; border-radius:8px; border:1px solid var(--border);
     width:100%; background:#fff; color:var(--text); font-family:inherit;
   }
+  textarea{min-height:88px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12.5px; resize:vertical;}
   label{display:block; font-size:13px; color:var(--muted); margin:10px 0 4px;}
+  .cloud-status{font-size:13px; margin:8px 0; padding:8px 10px; border-radius:8px; background:var(--bg);}
+  .cloud-status.ok{color:var(--success); background:var(--success-bg);}
+  .cloud-status.err{color:var(--danger); background:var(--danger-bg);}
 
   .week-nav{display:flex; align-items:center; justify-content:space-between; margin-bottom:8px; gap:8px;}
   .week-center{text-align:center;}
@@ -200,7 +204,19 @@
           <input type="file" accept="application/json" onchange="handleImportFile(this)" style="display:none">
         </label>
       </div>
-      <p class="hint" style="margin-top:12px;">이 앱은 지금 사용 중인 <strong>이 브라우저(기기)</strong>에만 자동 저장됩니다. PC와 휴대폰을 오가며 이어서 쓰려면, 사용하던 기기에서 "내보내기"로 받은 파일을 다른 기기에서 "가져오기" 해주세요.</p>
+      <p class="hint" style="margin-top:12px;">이 앱은 지금 사용 중인 <strong>이 브라우저(기기)</strong>에만 자동 저장됩니다. PC와 휴대폰을 오가며 이어서 쓰려면, 사용하던 기기에서 "내보내기"로 받은 파일을 다른 기기에서 "가져오기" 해주세요. (아래 실시간 동기화를 연결하면 이 과정이 필요 없어집니다.)</p>
+
+      <h2>실시간 동기화 (선택)</h2>
+      <p class="hint">무료 Firebase 프로젝트를 만들어 연결하면, 폰과 PC에서 같은 동기화 코드로 접속했을 때 진도 기록이 실시간으로 서로 반영됩니다. 설정 방법은 대화창에서 안내해드릴게요.</p>
+      <div id="cloud-status" class="cloud-status">연결 안 됨</div>
+      <label>Firebase 설정값 (콘솔에서 복사한 firebaseConfig 중괄호 { } 부분)</label>
+      <textarea id="cloud-config-input" placeholder='{"apiKey":"...","authDomain":"...","projectId":"...","storageBucket":"...","messagingSenderId":"...","appId":"..."}'></textarea>
+      <label>동기화 코드 (폰·PC에 똑같이 입력, 나만 아는 문자열로 설정)</label>
+      <input type="text" id="cloud-code-input" placeholder="예: jiwoong-2026-2학기">
+      <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:8px;">
+        <button class="btn btn-primary" data-action="cloud-connect">연결하기</button>
+        <button id="cloud-disconnect-btn" class="btn btn-ghost" data-action="cloud-disconnect" style="display:none;">연결 해제</button>
+      </div>
 
       <h2 class="danger-title">위험 구역</h2>
       <button class="btn btn-danger" data-action="reset-all">모든 데이터 초기화</button>
@@ -224,6 +240,170 @@ function todayISO(){ return isoOf(new Date()); }
 
 /* ---------- state ---------- */
 let state;
+
+/* ---------- cloud sync (optional Firebase) ---------- */
+const CLOUD_KEY = 'jindoApp_cloud_v1';
+let cloud = { enabled:false, config:null, code:'', db:null, unsub:null, lastStatusKind:null, lastStatusText:null };
+let suppressCloudPush = false;
+let cloudPushTimer = null;
+
+function nowTimeLabel(){ const d = new Date(); return pad(d.getHours())+':'+pad(d.getMinutes()); }
+
+function loadCloudConfig(){
+  try{
+    const raw = localStorage.getItem(CLOUD_KEY);
+    if(raw){
+      const parsed = JSON.parse(raw);
+      cloud.enabled = !!parsed.enabled;
+      cloud.config = parsed.config || null;
+      cloud.code = parsed.code || '';
+    }
+  }catch(e){ console.warn('클라우드 설정을 불러오지 못했습니다', e); }
+}
+
+function saveCloudConfig(){
+  try{
+    localStorage.setItem(CLOUD_KEY, JSON.stringify({enabled:cloud.enabled, config:cloud.config, code:cloud.code}));
+  }catch(e){ console.warn('클라우드 설정 저장 실패', e); }
+}
+
+function getSyncableState(){
+  return {
+    version: state.version,
+    classes: state.classes,
+    periodsPerDay: state.periodsPerDay,
+    periodTimes: state.periodTimes,
+    baseTimetable: state.baseTimetable,
+    weeks: state.weeks,
+    progress: state.progress,
+    lastBackup: state.lastBackup
+  };
+}
+
+async function loadFirebaseModules(){
+  if(loadFirebaseModules._cache) return loadFirebaseModules._cache;
+  const appMod = await import('https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js');
+  const fsMod = await import('https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js');
+  loadFirebaseModules._cache = Object.assign({}, appMod, fsMod);
+  return loadFirebaseModules._cache;
+}
+
+function updateCloudStatus(kind, text){
+  cloud.lastStatusKind = kind;
+  cloud.lastStatusText = text;
+  const el = document.getElementById('cloud-status');
+  if(el){
+    el.textContent = text;
+    el.classList.remove('ok','err');
+    if(kind) el.classList.add(kind);
+  }
+  const disBtn = document.getElementById('cloud-disconnect-btn');
+  if(disBtn) disBtn.style.display = cloud.enabled ? 'inline-block' : 'none';
+}
+
+function scheduleCloudPush(){
+  if(!cloud.enabled || !cloud.db) return;
+  clearTimeout(cloudPushTimer);
+  cloudPushTimer = setTimeout(pushStateToCloud, 700);
+}
+
+async function pushStateToCloud(){
+  if(!cloud.enabled || !cloud.db) return;
+  try{
+    const { doc, setDoc } = await loadFirebaseModules();
+    const ref = doc(cloud.db, 'jindoSync', cloud.code);
+    await setDoc(ref, getSyncableState());
+    updateCloudStatus('ok', '동기화 연결됨 · 마지막 전송 ' + nowTimeLabel());
+  }catch(e){
+    console.warn('클라우드 전송 실패', e);
+    updateCloudStatus('err', '전송 실패: ' + e.message);
+  }
+}
+
+function applyRemoteData(data){
+  suppressCloudPush = true;
+  if(data.classes) state.classes = data.classes;
+  if(data.periodsPerDay) state.periodsPerDay = data.periodsPerDay;
+  if(data.periodTimes) state.periodTimes = data.periodTimes;
+  if(data.baseTimetable) state.baseTimetable = data.baseTimetable;
+  state.weeks = data.weeks || {};
+  state.progress = data.progress || {};
+  if(data.lastBackup !== undefined) state.lastBackup = data.lastBackup;
+  migrateIfNeeded();
+  saveState();
+  suppressCloudPush = false;
+  render();
+  updateCloudStatus('ok', '동기화 연결됨 · 마지막 수신 ' + nowTimeLabel());
+}
+
+async function connectCloud(isAuto){
+  let configObj = cloud.config;
+  let code = cloud.code;
+  if(!isAuto){
+    const raw = document.getElementById('cloud-config-input').value.trim();
+    code = document.getElementById('cloud-code-input').value.trim();
+    if(!raw || !code){ alert('Firebase 설정값과 동기화 코드를 모두 입력해주세요'); return; }
+    try{ configObj = JSON.parse(raw); }
+    catch(e){ alert('Firebase 설정값 형식이 올바르지 않습니다. { 로 시작해서 } 로 끝나는 부분만 붙여넣어주세요.'); return; }
+  }
+  if(!configObj || !code) return;
+
+  updateCloudStatus(null, '연결 중...');
+  try{
+    const { initializeApp, getApps, getFirestore, doc, getDoc, onSnapshot } = await loadFirebaseModules();
+    const appName = 'jindoApp_' + code;
+    const existingApp = getApps().find(a => a.name === appName);
+    const app = existingApp || initializeApp(configObj, appName);
+    const db = getFirestore(app);
+    const ref = doc(db, 'jindoSync', code);
+
+    if(!isAuto){
+      const snap = await getDoc(ref);
+      if(snap.exists()){
+        const useCloud = confirm('클라우드에 이미 저장된 데이터가 있어요.\n\n확인 = 클라우드 데이터를 불러와 이 기기에 적용\n취소 = 지금 이 기기의 데이터를 클라우드에 올리기(덮어쓰기)');
+        if(useCloud) applyRemoteData(snap.data());
+      }
+    }
+
+    cloud.enabled = true;
+    cloud.config = configObj;
+    cloud.code = code;
+    cloud.db = db;
+    saveCloudConfig();
+
+    if(cloud.unsub) cloud.unsub();
+    cloud.unsub = onSnapshot(ref, (snapshot)=>{
+      if(snapshot.metadata.hasPendingWrites) return;
+      const data = snapshot.data();
+      if(!data) return;
+      applyRemoteData(data);
+    }, (err)=>{
+      updateCloudStatus('err', '동기화 오류: ' + err.message);
+    });
+
+    updateCloudStatus('ok', '동기화 연결됨');
+    if(!isAuto){
+      scheduleCloudPush();
+      showToast('동기화가 연결되었습니다');
+      render();
+    }
+  }catch(e){
+    console.error('클라우드 연결 실패', e);
+    updateCloudStatus('err', '연결 실패: ' + e.message);
+    cloud.enabled = false;
+    saveCloudConfig();
+  }
+}
+
+function disconnectCloud(){
+  if(cloud.unsub){ cloud.unsub(); cloud.unsub = null; }
+  cloud.enabled = false;
+  cloud.db = null;
+  saveCloudConfig();
+  updateCloudStatus(null, '연결 안 됨');
+  showToast('동기화를 해제했습니다');
+  render();
+}
 
 function buildSeedState(){
   const classes = [
@@ -295,6 +475,7 @@ function saveState(){
     const el = document.getElementById('save-indicator');
     if(el) el.textContent = '저장 실패 (저장공간 부족?)';
   }
+  if(cloud.enabled && !suppressCloudPush) scheduleCloudPush();
 }
 
 /* ---------- utils ---------- */
@@ -543,6 +724,12 @@ function renderSettingsView(){
     timeInputs += `<input type="text" value="${escapeAttr(state.periodTimes[i] || '')}" data-idx="${i}" onchange="handlePeriodTimeChange(this)" style="width:88px; display:inline-block; margin:2px 4px 2px 0;">`;
   }
   document.getElementById('period-times-list').innerHTML = timeInputs;
+
+  const cfgInput = document.getElementById('cloud-config-input');
+  const codeInput = document.getElementById('cloud-code-input');
+  if(cfgInput && !cfgInput.value && cloud.config) cfgInput.value = JSON.stringify(cloud.config);
+  if(codeInput && !codeInput.value && cloud.code) codeInput.value = cloud.code;
+  updateCloudStatus(cloud.lastStatusKind, cloud.lastStatusText || (cloud.enabled ? '동기화 연결됨' : '연결 안 됨'));
 }
 
 function handleRenameClass(id, val){
@@ -827,14 +1014,24 @@ function handleGlobalClick(e){
     case 'reset-all':
       handleResetAll();
       break;
+    case 'cloud-connect':
+      connectCloud(false);
+      break;
+    case 'cloud-disconnect':
+      disconnectCloud();
+      break;
   }
 }
 
 /* ---------- init ---------- */
 function init(){
   loadState();
+  loadCloudConfig();
   document.addEventListener('click', handleGlobalClick);
   render();
+  if(cloud.enabled && cloud.config && cloud.code){
+    connectCloud(true);
+  }
 }
 document.addEventListener('DOMContentLoaded', init);
 </script>
