@@ -209,8 +209,8 @@
       <h2>실시간 동기화 (선택)</h2>
       <p class="hint">무료 Firebase 프로젝트를 만들어 연결하면, 폰과 PC에서 같은 동기화 코드로 접속했을 때 진도 기록이 실시간으로 서로 반영됩니다. 설정 방법은 대화창에서 안내해드릴게요.</p>
       <div id="cloud-status" class="cloud-status">연결 안 됨</div>
-      <label>Firebase 설정값 (콘솔에서 복사한 firebaseConfig 중괄호 { } 부분)</label>
-      <textarea id="cloud-config-input" placeholder='{"apiKey":"...","authDomain":"...","projectId":"...","storageBucket":"...","messagingSenderId":"...","appId":"..."}'></textarea>
+      <label>Firebase 설정값 (콘솔에 나온 firebaseConfig 코드를 수정 없이 그대로 붙여넣으세요)</label>
+      <textarea id="cloud-config-input" placeholder='const firebaseConfig = { apiKey: "...", authDomain: "...", projectId: "...", ... };  ← 이런 형태 그대로 붙여넣기 가능'></textarea>
       <label>동기화 코드 (폰·PC에 똑같이 입력, 나만 아는 문자열로 설정)</label>
       <input type="text" id="cloud-code-input" placeholder="예: jiwoong-2026-2학기">
       <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:8px;">
@@ -336,6 +336,29 @@ function applyRemoteData(data){
   updateCloudStatus('ok', '동기화 연결됨 · 마지막 수신 ' + nowTimeLabel());
 }
 
+function parseFirebaseConfigInput(raw){
+  // Accepts either strict JSON, or the raw "const firebaseConfig = { apiKey: ... };" snippet
+  // that the Firebase console shows (unquoted keys, JS syntax) - pasted as-is, no editing needed.
+  const start = raw.indexOf('{');
+  const end = raw.lastIndexOf('}');
+  const snippet = (start >= 0 && end > start) ? raw.slice(start, end + 1) : raw;
+  let obj;
+  try{
+    obj = JSON.parse(snippet);
+  }catch(e1){
+    try{
+      // eslint-disable-next-line no-new-func
+      obj = Function('"use strict"; return (' + snippet + ');')();
+    }catch(e2){
+      throw new Error('형식을 읽을 수 없습니다');
+    }
+  }
+  if(!obj || typeof obj !== 'object' || !obj.apiKey || !obj.projectId){
+    throw new Error('apiKey / projectId가 포함된 firebaseConfig 형태가 아닙니다');
+  }
+  return obj;
+}
+
 async function connectCloud(isAuto){
   let configObj = cloud.config;
   let code = cloud.code;
@@ -343,8 +366,8 @@ async function connectCloud(isAuto){
     const raw = document.getElementById('cloud-config-input').value.trim();
     code = document.getElementById('cloud-code-input').value.trim();
     if(!raw || !code){ alert('Firebase 설정값과 동기화 코드를 모두 입력해주세요'); return; }
-    try{ configObj = JSON.parse(raw); }
-    catch(e){ alert('Firebase 설정값 형식이 올바르지 않습니다. { 로 시작해서 } 로 끝나는 부분만 붙여넣어주세요.'); return; }
+    try{ configObj = parseFirebaseConfigInput(raw); }
+    catch(e){ alert('Firebase 설정값을 읽을 수 없습니다. Firebase 콘솔에 나온 firebaseConfig 코드를 그대로(수정 없이) 복사해서 붙여넣어보세요.'); return; }
   }
   if(!configObj || !code) return;
 
