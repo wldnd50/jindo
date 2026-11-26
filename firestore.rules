@@ -1,0 +1,27 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Old clients address one document by its manually chosen sync code.
+    match /jindoSync/{code} {
+      allow get, create, update: if true;
+    }
+
+    // Each Google account owns one versioned JSON timetable and progress record.
+    match /jindoAccounts/{uid} {
+      function isOwner() {
+        return request.auth != null && request.auth.uid == uid
+          && request.auth.token.firebase.sign_in_provider == 'google.com';
+      }
+      function validRecord() {
+        let data = request.resource.data;
+        return data.keys().hasOnly(['revision', 'payload'])
+          && data.payload is string && data.payload.size() > 0
+          && data.revision is int;
+      }
+      allow get: if isOwner();
+      allow create: if isOwner() && validRecord() && request.resource.data.revision == 1;
+      allow update: if isOwner() && validRecord()
+        && request.resource.data.revision == resource.data.revision + 1;
+    }
+  }
+}

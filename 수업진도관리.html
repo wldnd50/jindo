@@ -131,12 +131,15 @@
     .modal-overlay{align-items:center;}
     .modal-sheet{border-radius:18px;}
   }
+  [hidden]{display:none !important;}
+  #account-indicator{margin-left:auto;max-width:45%;}
 </style>
 </head>
 <body>
   <header class="top">
     <div class="header-row">
       <h1>📚 수업 진도 관리</h1>
+      <button id="account-indicator" class="btn btn-ghost btn-sm" data-action="switch-tab" data-tab="settings">이 기기에 저장</button>
       <span id="save-indicator" class="save-indicator">저장됨</span>
     </div>
     <div id="backup-banner" class="backup-banner">
@@ -204,18 +207,21 @@
           <input type="file" accept="application/json" onchange="handleImportFile(this)" style="display:none">
         </label>
       </div>
-      <p class="hint" style="margin-top:12px;">이 앱은 지금 사용 중인 <strong>이 브라우저(기기)</strong>에만 자동 저장됩니다. PC와 휴대폰을 오가며 이어서 쓰려면, 사용하던 기기에서 "내보내기"로 받은 파일을 다른 기기에서 "가져오기" 해주세요. (아래 실시간 동기화를 연결하면 이 과정이 필요 없어집니다.)</p>
+      <p class="hint">진도와 시간표를 파일로 보관하거나 복원할 수 있습니다.</p>
 
-      <h2>실시간 동기화 (선택)</h2>
-      <p class="hint">무료 Firebase 프로젝트를 만들어 연결하면, 폰과 PC에서 같은 동기화 코드로 접속했을 때 진도 기록이 실시간으로 서로 반영됩니다. 설정 방법은 대화창에서 안내해드릴게요.</p>
-      <div id="cloud-status" class="cloud-status">연결 안 됨</div>
-      <label>Firebase 설정값 (콘솔에 나온 firebaseConfig 코드를 수정 없이 그대로 붙여넣으세요)</label>
-      <textarea id="cloud-config-input" placeholder='const firebaseConfig = { apiKey: "...", authDomain: "...", projectId: "...", ... };  ← 이런 형태 그대로 붙여넣기 가능'></textarea>
-      <label>동기화 코드 (폰·PC에 똑같이 입력, 나만 아는 문자열로 설정)</label>
-      <input type="text" id="cloud-code-input" placeholder="예: jiwoong-2026-2학기">
-      <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:8px;">
-        <button class="btn btn-primary" data-action="cloud-connect">연결하기</button>
-        <button id="cloud-disconnect-btn" class="btn btn-ghost" data-action="cloud-disconnect" style="display:none;">연결 해제</button>
+      <h2>Google 계정 동기화</h2>
+      <p class="hint">PC와 휴대폰에서 같은 Google 계정으로 로그인하면 시간표와 반별 진도가 자동으로 동기화됩니다.</p>
+      <strong id="account-email"></strong>
+      <div id="cloud-status" class="cloud-status" role="status">로그인하면 계정에 자동 저장됩니다.</div>
+      <button id="google-login" class="btn btn-primary" data-action="google-login">Google로 로그인</button>
+      <button id="google-logout" class="btn btn-ghost" data-action="google-logout" hidden>로그아웃</button>
+      <button id="device-import" class="btn btn-ghost" data-action="device-import" hidden>로그인 전 이 기기 기록 가져오기</button>
+      <button id="legacy-import" class="btn btn-ghost" data-action="legacy-import" hidden>이전 동기화 코드의 기록 가져오기</button>
+      <button id="sync-retry" class="btn btn-ghost" data-action="sync-retry" hidden>다시 연결</button>
+      <div id="account-conflict" hidden>
+        <p class="hint">두 곳에서 같은 계정의 기록을 수정했습니다. 필요하면 먼저 이 기기 기록을 백업하세요.</p>
+        <button class="btn btn-ghost" data-action="use-remote">계정 기록 사용</button>
+        <button class="btn btn-ghost" data-action="use-local">이 기기 기록 사용</button>
       </div>
 
       <h2 class="danger-title">위험 구역</h2>
@@ -225,6 +231,7 @@
 
   <div id="modal-root"></div>
 
+<script src="./account-sync.js"></script>
 <script>
 'use strict';
 const STORAGE_KEY = 'jindoApp_v1';
@@ -240,209 +247,6 @@ function todayISO(){ return isoOf(new Date()); }
 
 /* ---------- state ---------- */
 let state;
-
-/* ---------- cloud sync (optional Firebase) ---------- */
-const CLOUD_KEY = 'jindoApp_cloud_v1';
-let cloud = { enabled:false, config:null, code:'', db:null, unsub:null, lastStatusKind:null, lastStatusText:null };
-let suppressCloudPush = false;
-let cloudPushTimer = null;
-
-function nowTimeLabel(){ const d = new Date(); return pad(d.getHours())+':'+pad(d.getMinutes()); }
-
-function loadCloudConfig(){
-  try{
-    const raw = localStorage.getItem(CLOUD_KEY);
-    if(raw){
-      const parsed = JSON.parse(raw);
-      cloud.enabled = !!parsed.enabled;
-      cloud.config = parsed.config || null;
-      cloud.code = parsed.code || '';
-    }
-  }catch(e){ console.warn('클라우드 설정을 불러오지 못했습니다', e); }
-}
-
-function saveCloudConfig(){
-  try{
-    localStorage.setItem(CLOUD_KEY, JSON.stringify({enabled:cloud.enabled, config:cloud.config, code:cloud.code}));
-  }catch(e){ console.warn('클라우드 설정 저장 실패', e); }
-}
-
-function getSyncableState(){
-  return {
-    version: state.version,
-    classes: state.classes,
-    periodsPerDay: state.periodsPerDay,
-    periodTimes: state.periodTimes,
-    baseTimetable: state.baseTimetable,
-    weeks: state.weeks,
-    progress: state.progress,
-    lastBackup: state.lastBackup
-  };
-}
-
-function parseCloudDoc(data){
-  if(!data) return null;
-  if(data.payload){
-    try{ return JSON.parse(data.payload); }
-    catch(e){ console.warn('클라우드 데이터 파싱 실패', e); return null; }
-  }
-  // backward-compat: in case a doc was ever written in the old (pre-JSON-blob) shape
-  if(data.classes && data.baseTimetable) return data;
-  return null;
-}
-
-async function loadFirebaseModules(){
-  if(loadFirebaseModules._cache) return loadFirebaseModules._cache;
-  const appMod = await import('https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js');
-  const fsMod = await import('https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js');
-  loadFirebaseModules._cache = Object.assign({}, appMod, fsMod);
-  return loadFirebaseModules._cache;
-}
-
-function updateCloudStatus(kind, text){
-  cloud.lastStatusKind = kind;
-  cloud.lastStatusText = text;
-  const el = document.getElementById('cloud-status');
-  if(el){
-    el.textContent = text;
-    el.classList.remove('ok','err');
-    if(kind) el.classList.add(kind);
-  }
-  const disBtn = document.getElementById('cloud-disconnect-btn');
-  if(disBtn) disBtn.style.display = cloud.enabled ? 'inline-block' : 'none';
-}
-
-function scheduleCloudPush(){
-  if(!cloud.enabled || !cloud.db) return;
-  clearTimeout(cloudPushTimer);
-  cloudPushTimer = setTimeout(pushStateToCloud, 700);
-}
-
-async function pushStateToCloud(){
-  if(!cloud.enabled || !cloud.db) return;
-  try{
-    const { doc, setDoc } = await loadFirebaseModules();
-    const ref = doc(cloud.db, 'jindoSync', cloud.code);
-    // Firestore doesn't support nested arrays (baseTimetable is an array of arrays),
-    // so the whole state is serialized into one JSON string field instead.
-    await setDoc(ref, { payload: JSON.stringify(getSyncableState()), updatedAt: new Date().toISOString() });
-    updateCloudStatus('ok', '동기화 연결됨 · 마지막 전송 ' + nowTimeLabel());
-  }catch(e){
-    console.warn('클라우드 전송 실패', e);
-    updateCloudStatus('err', '전송 실패: ' + e.message);
-  }
-}
-
-function applyRemoteData(data){
-  suppressCloudPush = true;
-  if(data.classes) state.classes = data.classes;
-  if(data.periodsPerDay) state.periodsPerDay = data.periodsPerDay;
-  if(data.periodTimes) state.periodTimes = data.periodTimes;
-  if(data.baseTimetable) state.baseTimetable = data.baseTimetable;
-  state.weeks = data.weeks || {};
-  state.progress = data.progress || {};
-  if(data.lastBackup !== undefined) state.lastBackup = data.lastBackup;
-  migrateIfNeeded();
-  saveState();
-  suppressCloudPush = false;
-  render();
-  updateCloudStatus('ok', '동기화 연결됨 · 마지막 수신 ' + nowTimeLabel());
-}
-
-function parseFirebaseConfigInput(raw){
-  // Accepts either strict JSON, or the raw "const firebaseConfig = { apiKey: ... };" snippet
-  // that the Firebase console shows (unquoted keys, JS syntax) - pasted as-is, no editing needed.
-  const start = raw.indexOf('{');
-  const end = raw.lastIndexOf('}');
-  const snippet = (start >= 0 && end > start) ? raw.slice(start, end + 1) : raw;
-  let obj;
-  try{
-    obj = JSON.parse(snippet);
-  }catch(e1){
-    try{
-      // eslint-disable-next-line no-new-func
-      obj = Function('"use strict"; return (' + snippet + ');')();
-    }catch(e2){
-      throw new Error('형식을 읽을 수 없습니다');
-    }
-  }
-  if(!obj || typeof obj !== 'object' || !obj.apiKey || !obj.projectId){
-    throw new Error('apiKey / projectId가 포함된 firebaseConfig 형태가 아닙니다');
-  }
-  return obj;
-}
-
-async function connectCloud(isAuto){
-  let configObj = cloud.config;
-  let code = cloud.code;
-  if(!isAuto){
-    const raw = document.getElementById('cloud-config-input').value.trim();
-    code = document.getElementById('cloud-code-input').value.trim();
-    if(!raw || !code){ alert('Firebase 설정값과 동기화 코드를 모두 입력해주세요'); return; }
-    try{ configObj = parseFirebaseConfigInput(raw); }
-    catch(e){ alert('Firebase 설정값을 읽을 수 없습니다. Firebase 콘솔에 나온 firebaseConfig 코드를 그대로(수정 없이) 복사해서 붙여넣어보세요.'); return; }
-  }
-  if(!configObj || !code) return;
-
-  updateCloudStatus(null, '연결 중...');
-  try{
-    const { initializeApp, getApps, getFirestore, doc, getDoc, onSnapshot } = await loadFirebaseModules();
-    const appName = 'jindoApp_' + code;
-    const existingApp = getApps().find(a => a.name === appName);
-    const app = existingApp || initializeApp(configObj, appName);
-    const db = getFirestore(app);
-    const ref = doc(db, 'jindoSync', code);
-
-    if(!isAuto){
-      const snap = await getDoc(ref);
-      if(snap.exists()){
-        const remoteData = parseCloudDoc(snap.data());
-        if(remoteData){
-          const useCloud = confirm('클라우드에 이미 저장된 데이터가 있어요.\n\n확인 = 클라우드 데이터를 불러와 이 기기에 적용\n취소 = 지금 이 기기의 데이터를 클라우드에 올리기(덮어쓰기)');
-          if(useCloud) applyRemoteData(remoteData);
-        }
-      }
-    }
-
-    cloud.enabled = true;
-    cloud.config = configObj;
-    cloud.code = code;
-    cloud.db = db;
-    saveCloudConfig();
-
-    if(cloud.unsub) cloud.unsub();
-    cloud.unsub = onSnapshot(ref, (snapshot)=>{
-      if(snapshot.metadata.hasPendingWrites) return;
-      const remoteData = parseCloudDoc(snapshot.data());
-      if(!remoteData) return;
-      applyRemoteData(remoteData);
-    }, (err)=>{
-      updateCloudStatus('err', '동기화 오류: ' + err.message);
-    });
-
-    updateCloudStatus('ok', '동기화 연결됨');
-    if(!isAuto){
-      scheduleCloudPush();
-      showToast('동기화가 연결되었습니다');
-      render();
-    }
-  }catch(e){
-    console.error('클라우드 연결 실패', e);
-    updateCloudStatus('err', '연결 실패: ' + e.message);
-    cloud.enabled = false;
-    saveCloudConfig();
-  }
-}
-
-function disconnectCloud(){
-  if(cloud.unsub){ cloud.unsub(); cloud.unsub = null; }
-  cloud.enabled = false;
-  cloud.db = null;
-  saveCloudConfig();
-  updateCloudStatus(null, '연결 안 됨');
-  showToast('동기화를 해제했습니다');
-  render();
-}
 
 function buildSeedState(){
   const classes = [
@@ -503,7 +307,8 @@ function loadState(){
 
 function saveState(){
   try{
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+    if (account) saveAccountCopy();
+    else localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
     const el = document.getElementById('save-indicator');
     if(el){
       const d = new Date();
@@ -514,7 +319,7 @@ function saveState(){
     const el = document.getElementById('save-indicator');
     if(el) el.textContent = '저장 실패 (저장공간 부족?)';
   }
-  if(cloud.enabled && !suppressCloudPush) scheduleCloudPush();
+  if (account) queueAccountSave();
 }
 
 /* ---------- utils ---------- */
@@ -577,6 +382,7 @@ function render(){
   else if(state.ui.activeTab === 'base') renderBaseView();
   else if(state.ui.activeTab === 'settings') renderSettingsView();
   renderModal();
+  if (account?.latest && !state.ui.modal) queueMicrotask(() => { if (account) reconcile(account); });
 }
 
 function renderBackupBanner(){
@@ -764,11 +570,7 @@ function renderSettingsView(){
   }
   document.getElementById('period-times-list').innerHTML = timeInputs;
 
-  const cfgInput = document.getElementById('cloud-config-input');
-  const codeInput = document.getElementById('cloud-code-input');
-  if(cfgInput && !cfgInput.value && cloud.config) cfgInput.value = JSON.stringify(cloud.config);
-  if(codeInput && !codeInput.value && cloud.code) codeInput.value = cloud.code;
-  updateCloudStatus(cloud.lastStatusKind, cloud.lastStatusText || (cloud.enabled ? '동기화 연결됨' : '연결 안 됨'));
+  syncButtons();
 }
 
 function handleRenameClass(id, val){
@@ -964,7 +766,7 @@ function handleImportFile(fileInput){
     try{
       const parsed = JSON.parse(e.target.result);
       if(!parsed.classes || !parsed.baseTimetable) throw new Error('형식이 올바르지 않습니다');
-      if(!confirm('가져오기를 하면 이 기기에 저장된 데이터를 덮어씁니다. 계속할까요?')){ fileInput.value=''; return; }
+      if(!confirm('가져오기를 하면 현재 열려 있는 진도와 시간표를 교체합니다. 로그인 중이면 같은 계정의 다른 기기에도 반영됩니다. 계속할까요?')){ fileInput.value=''; return; }
       state = parsed;
       migrateIfNeeded();
       saveState();
@@ -979,7 +781,7 @@ function handleImportFile(fileInput){
 }
 
 function handleResetAll(){
-  if(!confirm('정말 모든 데이터를 초기화할까요? 이 작업은 되돌릴 수 없습니다.')) return;
+  if(!confirm('현재 진도와 시간표를 모두 초기화할까요? 로그인 중이면 같은 계정의 다른 기기에도 반영됩니다. 이 작업은 되돌릴 수 없습니다.')) return;
   state = buildSeedState();
   saveState();
   render();
@@ -1053,24 +855,22 @@ function handleGlobalClick(e){
     case 'reset-all':
       handleResetAll();
       break;
-    case 'cloud-connect':
-      connectCloud(false);
-      break;
-    case 'cloud-disconnect':
-      disconnectCloud();
-      break;
+    case 'google-login': googleLogin(); break;
+    case 'google-logout': googleLogout(); break;
+    case 'sync-retry': if (account) observeAccount(account); break;
+    case 'device-import': importDeviceData(); break;
+    case 'legacy-import': importPreviousSync(); break;
+    case 'use-remote': resolveAccountConflict(false); break;
+    case 'use-local': resolveAccountConflict(true); break;
   }
 }
 
 /* ---------- init ---------- */
 function init(){
   loadState();
-  loadCloudConfig();
   document.addEventListener('click', handleGlobalClick);
   render();
-  if(cloud.enabled && cloud.config && cloud.code){
-    connectCloud(true);
-  }
+  initAccountSync().catch(console.warn);
 }
 document.addEventListener('DOMContentLoaded', init);
 </script>
